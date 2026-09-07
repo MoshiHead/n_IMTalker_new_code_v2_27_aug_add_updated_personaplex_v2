@@ -3637,13 +3637,34 @@ class LiveHeliumFMOptions(BaseOptions):
         parser.add_argument("--prebuffer_chunks", type=int, default=3, help="Avatar chunks queued before sender starts pacing")
         parser.add_argument("--frame_q_backpressure", type=int, default=160)
         parser.add_argument(
-            "--max_event_backlog_sec", type=float, default=0.6,
+            "--max_input_buffer_sec", type=float, default=2.0,
+            help="Hard cap on the microphone backlog held in the PersonaPlex engine's input "
+                 "buffer (see MoshiOnlyEngine.append_browser_pcm). This is the pipeline's ONLY "
+                 "graceful-degradation valve: everything downstream of it runs at exactly real "
+                 "time (the GPU producer blocks on frame_q_backpressure and the senders pace at "
+                 "fps/12.5Hz), so any backlog that forms -- warmup, session reset, a render "
+                 "stall -- otherwise becomes a PERMANENT end-to-end delay for the whole session. "
+                 "A RunPod RTX 5090 run without this cap measured a rock-steady 9.1-9.6s of "
+                 "standing latency on every turn, which is what turned ~3-4s knowledge-only "
+                 "answers into 10-12s ones. When the cap is hit the OLDEST audio is dropped "
+                 "(and loudly logged), keeping the model within this many seconds of real time. "
+                 "0 disables the cap and restores the unbounded behaviour.",
+        )
+        parser.add_argument(
+            "--max_event_backlog_sec", type=float, default=3.0,
             help="Backpressure cap on persona_event_q, the queue where this pipeline's standing "
                  "latency actually accumulates (logs_4: a rock-steady 9.1-9.6s on every turn; "
                  "logs_6: 10.72s while both media queues were normal). The producer waits when the "
                  "queue is this deep instead of racing ahead of the real-time consumer. Nothing is "
                  "dropped -- earlier versions dropped events or media here and that skewed the "
-                 "audio/video timelines apart and deleted answers. 0 disables the cap.",
+                 "audio/video timelines apart and deleted answers. 0 disables the cap. "
+                 "MUST stay above the pipeline's DESIGNED sawtooth: the GPU consumer blocks until "
+                 "frame_q drains below frame_q_backpressure and then swallows a whole chunk at "
+                 "once, so this queue normally oscillates between 0 and ~audio_chunk_sec worth of "
+                 "events (25 events == 2.0s at the 2s-chunk default). The old 0.6s default sat "
+                 "BELOW that floor, so the cap was permanently engaged and starved the model "
+                 "(logs_7: a turn produced 0 chars and 0 audio packets). 3.0s leaves ~1s of "
+                 "headroom over the sawtooth, so the hold only ever engages on real drift.",
         )
         parser.add_argument(
             "--media_resync_lag_sec", type=float, default=0.0,
@@ -3912,6 +3933,7 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                 web_search_timeout=float(getattr(args, "web_search_timeout", 3.0)),
                 web_search_min_score=float(getattr(args, "web_search_min_score", 0.15)),
                 conversation_log_dir=getattr(args, "conversation_log_dir", ""),
+                max_input_buffer_sec=float(getattr(args, "max_input_buffer_sec", 2.0)),
                 thinking_sound_path=getattr(args, "thinking_sound_path", ""),
                 search_max_filler_sec=float(getattr(args, "search_max_filler_sec", 6.0)),
                 compressor_mode=getattr(args, "compressor_mode", "extractive_first"),
@@ -4301,18 +4323,22 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                         * TARGET_SR / MIMI_FRAME_SIZE
                     )),
                 )
-                # Hard ceiling on any single hold. Deliberately SHORT: the gate
-                # is evaluated from the previous iteration, so an answer can
-                # start while a hold is already running, and whatever remains
-                # of that hold delays the answer's onset. Throttling an idle
-                # backlog does not need a long hold -- a short one simply
-                # re-enters next iteration while the model stays idle -- but a
-                # long one would cost real time at exactly the wrong moment.
+                # Hard ceiling on any single hold, so one iteration can never
+                # stall for long; it simply re-enters next iteration while the
+                # queue is still over cap. Mic audio that arrives during a hold
+                # accumulates in the engine's own input buffer, which is now
+                # bounded by --max_input_buffer_sec -- so a sustained hold
+                # makes the model SKIP stale audio and stay near real time
+                # instead of falling permanently behind. That closed loop
+                # (block the producer, drop the oldest mic audio) is exactly
+                # what the single-threaded AHAudioPace server did via frame_q
+                # backpressure, and is why its standing latency never grew.
                 _EVENT_Q_HOLD_MAX_S = 0.2
                 print(
                     f"[EVENT-BACKLOG] backpressure cap: {_EVENT_Q_MAX} events "
-                    f"(~{_EVENT_Q_MAX * 0.08:.2f}s), idle-gated, max hold "
-                    f"{_EVENT_Q_HOLD_MAX_S:.1f}s; 0 disables",
+                    f"(~{_EVENT_Q_MAX * 0.08:.2f}s), max hold "
+                    f"{_EVENT_Q_HOLD_MAX_S:.1f}s per iteration; 0 disables. Mic backlog valve: "
+                    f"{float(getattr(args, 'max_input_buffer_sec', 2.0)):.2f}s",
                     flush=True,
                 )
                 print(
@@ -4393,14 +4419,28 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                     # answer_text_tokens=0, audio_packets_streamed=0 -- the
                     # model never generated at all.
                     #
-                    # So: only hold while the model is IDLE (the startup mic
-                    # burst, and the dead air between turns, which is where the
-                    # backlog is actually built), never once it is speaking,
-                    # and never for longer than one chunk period regardless.
-                    if (
-                        _EVENT_Q_MAX > 0
-                        and consecutive_silent_events >= _BACKLOG_SILENCE_RUN
-                    ):
+                    # The real defect in that logs_7 run was the CAP VALUE, not
+                    # the hold: at 0.6s (7 events) it sat below the pipeline's
+                    # designed sawtooth. The GPU consumer blocks until frame_q
+                    # drains below frame_q_backpressure and then swallows a
+                    # whole 2.0s chunk at once, so this queue oscillates 0 ->
+                    # ~25 events as a matter of DESIGN. A 7-event cap is
+                    # therefore engaged essentially all the time, which is what
+                    # stopped the model generating. The default is now 3.0s
+                    # (~37 events), a full second of headroom above that
+                    # sawtooth, so the hold engages only on genuine drift.
+                    #
+                    # The idle gate that used to guard this is gone: it made the
+                    # cap useless for the case it exists for. A stall that opens
+                    # a gap MID-ANSWER never sees 1.5s of silence afterwards, so
+                    # the gap was never throttled and became permanent. Holding
+                    # while the model is speaking is safe and proven -- the
+                    # single-threaded AHAudioPace server blocked the identical
+                    # moshi-step loop on frame_q backpressure on every chunk --
+                    # provided (a) the cap is above the sawtooth, and (b) the
+                    # mic buffer is bounded so a hold sheds stale audio rather
+                    # than deferring it. Both now hold.
+                    if _EVENT_Q_MAX > 0:
                         _hold_deadline = time.perf_counter() + _EVENT_Q_HOLD_MAX_S
                         while (
                             persona_event_q.qsize() >= _EVENT_Q_MAX
@@ -4629,6 +4669,15 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                                 frame_q=frame_q.qsize() if frame_q is not None else -1,
                                 audio_q=audio_q.qsize() if audio_q is not None else -1,
                                 mic_q=mic_q.qsize() if mic_q is not None else -1,
+                                # The pipeline's standing latency, at its
+                                # source. Bounded by --max_input_buffer_sec;
+                                # if this ever sits at the cap the GPU is not
+                                # keeping up with real time and audio is being
+                                # shed to hold latency down.
+                                input_backlog_s=round(_persona_buffered_samples() / TARGET_SR, 2),
+                                input_dropped_s=round(
+                                    getattr(reply_engine, "_input_dropped_samples", 0) / TARGET_SR, 2
+                                ),
                                 event_q_latency_s=round(persona_event_q.qsize() * 0.08, 2),
                                 audio_q_latency_s=round((audio_q.qsize() if audio_q is not None else 0) * 0.08, 2),
                                 video_q_latency_s=round(

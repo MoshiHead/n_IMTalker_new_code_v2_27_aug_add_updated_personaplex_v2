@@ -197,6 +197,7 @@ class MoshiOnlyEngine:
         web_search_timeout: float = 3.0,
         web_search_min_score: float = 0.15,
         conversation_log_dir: str = "",
+        max_input_buffer_sec: float = 2.0,
     ) -> None:
         from conversation_logger import ConversationLogger  # IMTalker/ is on sys.path by the time this runs
 
@@ -208,6 +209,11 @@ class MoshiOnlyEngine:
         self.device = torch.device(device)
         self.placeholder_jpeg_b64 = placeholder_jpeg_b64
         self.input_buffer = np.zeros(0, dtype=np.float32)
+        # Backlog cap + drop accounting (see append_browser_pcm). Set before
+        # any audio can arrive so the very first append is already bounded.
+        self.max_input_buffer_sec = float(max_input_buffer_sec)
+        self._input_dropped_samples = 0
+        self._input_drop_last_log = 0.0
         self.step = 0
         self.skip_first = True
         self.sampled_text = ""
@@ -750,6 +756,62 @@ class MoshiOnlyEngine:
             wav = torch.from_numpy(pcm).view(1, -1)
             pcm = torchaudio.functional.resample(wav, int(input_sr), TARGET_SR)[0].numpy()
         self.input_buffer = np.concatenate([self.input_buffer, pcm.astype(np.float32, copy=False)])
+
+        # -- Bound the mic backlog -------------------------------------------
+        # Without this cap the buffer is unbounded, and that makes any backlog
+        # PERMANENT rather than temporary. Everything downstream of this point
+        # -- the PersonaPlex worker, the avatar/render GPU thread, both media
+        # senders -- is rate-limited to exactly real time (the GPU producer
+        # blocks once frame_q_backpressure rendered frames are queued, and the
+        # sender drains those at fps). So the pipeline consumes one second of
+        # microphone audio per second of wall clock and can NEVER run fast
+        # enough to catch up. Whatever backlog accumulates -- during model
+        # warmup, system-prompt stepping on session reset, a render hiccup, or
+        # any transient GPU stall -- therefore becomes a fixed end-to-end delay
+        # that persists for the rest of the session.
+        #
+        # That is exactly the regression this restores: a RunPod RTX 5090 run
+        # measured a rock-steady 9.1-9.6s of standing latency on EVERY turn
+        # (search and non-search alike), which is what turned ~3-4s
+        # knowledge-only answers into 10-12s ones.
+        #
+        # Dropping the OLDEST audio keeps the newest, which is what a live
+        # conversation needs: being 10s behind is far worse than missing the
+        # first moments of a sentence. Every drop is logged, because silently
+        # discarding user speech would be its own bug.
+        max_samples = int(float(getattr(self, "max_input_buffer_sec", 0.0)) * TARGET_SR)
+        if max_samples > 0 and self.input_buffer.shape[0] > max_samples:
+            dropped = int(self.input_buffer.shape[0] - max_samples)
+            self.input_buffer = self.input_buffer[dropped:].copy()
+            self._input_dropped_samples += dropped
+            now = time.perf_counter()
+            if now - self._input_drop_last_log >= 2.0:
+                self._input_drop_last_log = now
+                total_s = self._input_dropped_samples / TARGET_SR
+                print(
+                    f"[liveTry] microphone backlog exceeded "
+                    f"{max_samples / TARGET_SR:.2f}s -- dropped {dropped / TARGET_SR:.2f}s of the "
+                    f"oldest audio to stop the reply delay growing ({total_s:.1f}s dropped this "
+                    f"session). The GPU cannot keep up with real time; lower the render cost "
+                    f"(--render_sub_batch / --jpeg_quality / --nfe) or raise "
+                    f"--max_input_buffer_sec to trade latency for completeness.",
+                    flush=True,
+                )
+                with contextlib.suppress(Exception):
+                    self.conv_logger.event(
+                        "input_backlog_drop",
+                        f"dropped={dropped / TARGET_SR:.2f}s total={total_s:.1f}s",
+                        dropped_s=round(dropped / TARGET_SR, 3),
+                        total_dropped_s=round(total_s, 2),
+                        cap_s=round(max_samples / TARGET_SR, 2),
+                    )
+
+    def input_backlog_sec(self) -> float:
+        """Seconds of microphone audio waiting to be processed. This is the
+        single best predictor of how late the next reply will be: the pipeline
+        runs at real time, so a backlog here is a delay that will not shrink on
+        its own."""
+        return float(self.input_buffer.shape[0]) / TARGET_SR
 
     @torch.no_grad()
     def process_ready_steps(self) -> list[dict]:

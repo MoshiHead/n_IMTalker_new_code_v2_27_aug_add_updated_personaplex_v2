@@ -182,14 +182,31 @@ if [[ "$ENABLE_SEARCH" == "1" ]]; then
     echo "[warn] thinking sound not found at $THINKING_SOUND_PATH -- searches will wait in silence" >&2
   }
 fi
+# -- Standing-latency valves (LATENCY FIX, restored from the AHAudioPace server) --
+# MAX_INPUT_BUFFER_SEC caps the microphone backlog held inside the PersonaPlex
+# engine. Everything after that buffer runs at exactly real time (the GPU producer
+# blocks on --frame_q_backpressure; both senders pace at fps / 12.5Hz), so the
+# pipeline can never catch up on a backlog: whatever accumulates during warmup,
+# session reset or a render stall becomes a PERMANENT delay on every later turn.
+# Without this cap a RunPod RTX 5090 run measured a rock-steady 9.1-9.6s of standing
+# latency on every turn -- that is the whole difference between ~3-4s and 10-12s
+# answers on questions the model answers from its own knowledge. When the cap is hit
+# the OLDEST audio is dropped and loudly logged. Lower it (e.g. 1.0) to trade a
+# little completeness for less latency; set 0 only to reproduce the old unbounded
+# behaviour.
+#
+# MAX_EVENT_BACKLOG_SEC bounds persona_event_q the same way. It must stay ABOVE the
+# pipeline's designed sawtooth -- the consumer swallows a whole --audio_chunk_sec
+# chunk at once, so that queue normally oscillates 0 -> ~2.0s -- and the previous
+# 0.6s default sat below that floor, throttling the model continuously (logs_7).
 declare -A hashes=(
- ["$IM/imtalker_personaplex_try_vad2_8998.py"]="23424d06480e29593cd721838e27c1ddeaec7e5ab772c50c3c92f5f615398f1f"
+ ["$IM/imtalker_personaplex_try_vad2_8998.py"]="f09c826cec5ee472c7211c0ae01a8d1da5005a4036c4ccabd590dd8be711ffb4"
  ["$IM/static/index_v3_binary_fullscreen_robot_try_vad2.html"]="5cf3981351668e0366b7b4adf2f36c7e43f5ab0c672f6616a343a72817582fa6"
  ["$IM/static/assets/robert_idle_10s.mp4"]="6bdfb847fb3dd2a76d42278a138e26e2729bf5ed938f6733a3b428768a9e7916"
  ["$IM/experiments/original_pod_8998/FM.py"]="8620d6cad2b945276a792a1d63159369654cbb83f9114ab5788f93a3d8daf5d9"
  ["$IM/experiments/original_pod_8998/FMT.py"]="286eb512e710926b0a88d1bc47f14aef5cfc3ef6fc0987fc3cf0d9e7bd004c5d"
- ["$IM/liveTry.py"]="201ee853c21e6b0b9b4dc590928734e2236ef11c69d1143afa80257333b46935"
- ["$IM/liveTry_cached.py"]="32e6818c7f7e138323e9eabe7f21cca365a4828893154af043b9c040f89dbf2e"
+ ["$IM/liveTry.py"]="14b44654567a549d6a70b7d83a30de09a459a7ea5e79d6bc8f9237c43b062775"
+ ["$IM/liveTry_cached.py"]="00368c6ceb31c64f56559424cf9c715aa11dcbc67e398a445a08972e1a4283e9"
  ["$IM/seedvc_runtime.py"]="fe46773af65e010e3d6f41732f0fa1c3e3cf6a8221d9c68718e15561062337f7"
  ["$IM/ws_av_binary_codec.py"]="c090b6a5a076743055f1dd34301662405a28d5cb1636556e9de4c895ddffe4d3"
  ["$BNB/voices/Robert_5.pt"]="a9684503d2a9d37f527341c9a0385b9ed0943eac955b40159bc34f4796563c3d"
@@ -242,5 +259,6 @@ exec python -u "$IM/imtalker_personaplex_try_vad2_8998.py" \
  --jpeg_quality 90 --device cuda --reply_audio_gain 1.0 --output_audio_codec opus \
  --blink_motion_path "$ROOT/checkpoints/lora/3robert_audio3_ditto_static_motion.pt" --enable_eye_blink_composite \
  --suppress_media_watchdog_sec "${SUPPRESS_MEDIA_WATCHDOG_SEC:-3.0}" \
- --max_event_backlog_sec "${MAX_EVENT_BACKLOG_SEC:-0.6}" \
+ --max_event_backlog_sec "${MAX_EVENT_BACKLOG_SEC:-3.0}" \
+ --max_input_buffer_sec "${MAX_INPUT_BUFFER_SEC:-2.0}" \
  "${SEARCH_ARGS[@]}"
