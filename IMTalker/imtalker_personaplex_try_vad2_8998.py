@@ -794,7 +794,10 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
             note=f"stopped because {reason}, played {self._thinking_sound_play_count}x",
         )
 
-    def note_audio_streamed(self, packet_rms: float) -> None:
+    def note_audio_streamed(
+        self, packet_rms: float, queued_s: float | None = None,
+        audio_q_depth: int | None = None,
+    ) -> None:
         """Called by the websocket audio sender the instant a packet is written
         to the socket -- the ONLY point in the pipeline that can honestly say
         the user was sent audio.
@@ -823,10 +826,23 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
             )
             generated = self._turn_first_audio_generated_perf
             if generated is not None:
-                self.conv_logger.latency.count(
-                    turn_id,
-                    generated_to_sent_s=round(max(0.0, now - generated), 3),
-                )
+                total_wait = max(0.0, now - generated)
+                # Split that wait at the one boundary that matters for tuning.
+                # queued_s is how long THIS packet sat in audio_q after the GPU
+                # thread published it, so the remainder is everything upstream:
+                # waiting for the rest of the chunk's steps to arrive, plus FM
+                # and the render/JPEG of the frames it is interleaved with.
+                # Without this split, "generated_to_sent_s=5.87" says a delay
+                # exists but not which half of the pipeline owns it.
+                counts = {"generated_to_sent_s": round(total_wait, 3)}
+                if queued_s is not None:
+                    counts["audio_queue_wait_s"] = round(max(0.0, queued_s), 3)
+                    counts["produce_to_publish_s"] = round(
+                        max(0.0, total_wait - max(0.0, queued_s)), 3
+                    )
+                if audio_q_depth is not None:
+                    counts["audio_q_depth_at_stream_start"] = int(audio_q_depth)
+                self.conv_logger.latency.count(turn_id, **counts)
         except Exception:
             pass
 
@@ -3637,7 +3653,7 @@ class LiveHeliumFMOptions(BaseOptions):
         parser.add_argument("--prebuffer_chunks", type=int, default=3, help="Avatar chunks queued before sender starts pacing")
         parser.add_argument("--frame_q_backpressure", type=int, default=160)
         parser.add_argument(
-            "--max_input_buffer_sec", type=float, default=2.0,
+            "--max_input_buffer_sec", type=float, default=1.2,
             help="Hard cap on the microphone backlog held in the PersonaPlex engine's input "
                  "buffer (see MoshiOnlyEngine.append_browser_pcm). This is the pipeline's ONLY "
                  "graceful-degradation valve: everything downstream of it runs at exactly real "
@@ -3648,7 +3664,15 @@ class LiveHeliumFMOptions(BaseOptions):
                  "standing latency on every turn, which is what turned ~3-4s knowledge-only "
                  "answers into 10-12s ones. When the cap is hit the OLDEST audio is dropped "
                  "(and loudly logged), keeping the model within this many seconds of real time. "
-                 "0 disables the cap and restores the unbounded behaviour.",
+                 "0 disables the cap and restores the unbounded behaviour. "
+                 "1.2s rather than 2.0s on purpose: 2.0s is exactly one avatar chunk, which is "
+                 "enough buffered audio for the PersonaPlex worker to get a WHOLE CHUNK ahead of "
+                 "the render thread during the session-start burst -- a lead that then never "
+                 "drains, because from that point both run at exactly real time. Simulated against "
+                 "conversation_1.log's measured render cost, every value from 0.4s to 1.5s gives "
+                 "the same delivery latency and 2.0s costs an extra ~0.5s. 1.2s keeps comfortable "
+                 "margin for bursty Opus arrival over the RunPod proxy while staying below that "
+                 "cliff.",
         )
         parser.add_argument(
             "--max_event_backlog_sec", type=float, default=3.0,
@@ -5031,8 +5055,79 @@ def build_app(args: argparse.Namespace) -> FastAPI:
 
 
                         t_chunk_start = time.perf_counter()
-                        staged_frames: list[dict] = []
+                        # -- Interleaved publication (LATENCY FIX) ------------
+                        #
+                        # This block used to render all 50 frames into a
+                        # staged_frames list and publish the whole chunk --
+                        # video AND audio -- only once the last frame was
+                        # encoded. conversation_1.log measured what that costs:
+                        # the model produced its first audible frame +0.04-0.42s
+                        # after the question, but the first audio packet reached
+                        # the websocket +4.4-5.9s after it (generated_to_sent_s
+                        # 3.98 / 4.84 / 5.39 / 5.87). Two of the three terms in
+                        # that delay came from publishing atomically:
+                        #
+                        #   1. render+JPEG of the whole chunk (measured at a
+                        #      very steady ~1.22s per 2.0s chunk across all four
+                        #      turns) sat entirely IN FRONT of the audio, even
+                        #      though the audio needed none of it; and
+                        #   2. publishing 50 frames at once made the media
+                        #      queues a sawtooth between frame_q_backpressure
+                        #      (32) and 32+50=82 frames, so the standing queue
+                        #      depth averaged ~2.3s instead of ~1.3s.
+                        #
+                        # Atomicity was never what kept audio and video in sync:
+                        # BOTH senders pace on an absolute, INDEX-derived
+                        # schedule anchored at the shared media_epoch (audio:
+                        # epoch + idx*0.08; video: epoch + idx/fps). Sync comes
+                        # from those indices, not from the order things were
+                        # enqueued. So publishing each sub-batch as it finishes
+                        # -- frames first, then exactly the audio steps whose
+                        # frames are now all rendered -- keeps every index pair
+                        # on the identical timeline while making both available
+                        # ~1.1s sooner, and fills the queues smoothly (6 frames
+                        # at a time) instead of in 50-frame bursts.
+                        #
+                        # audio step k covers frames [k*n_frames/n_audio,
+                        # (k+1)*n_frames/n_audio), so after rendering through
+                        # frame sb_end exactly floor(sb_end*n_audio/n_frames)
+                        # steps are fully covered. Integer math, so a
+                        # render_sub_batch that does not divide evenly into the
+                        # audio grid simply holds a step back one sub-batch
+                        # rather than emitting audio ahead of its frames.
+                        #
+                        # force_idle marks a step whose outgoing audio is the
+                        # thinking sound or the post-injection mask, not the
+                        # assistant's answer. It travels with the packet so the
+                        # sender does not mistake the waiting cue for the
+                        # answer starting to stream (audio_stream_started).
+                        # Indexed defensively: used_audio/used_steps are sliced
+                        # together on every path that sets both, but one branch
+                        # reassigns used_steps alone.
+                        masked_flags = [bool(s.get("force_idle")) for s in used_steps]
+                        n_audio_steps = len(used_audio)
+                        audio_published = 0
 
+                        def _publish_audio_through(step_limit: int) -> None:
+                            """Enqueue audio steps [audio_published, step_limit)."""
+                            nonlocal audio_published, staged_audio_seq
+                            while audio_published < step_limit:
+                                audio_idx = audio_published
+                                _enqueue_audio({
+                                    "audio_packet_index": staged_audio_seq,
+                                    "audio_pcm": np.asarray(
+                                        used_audio[audio_idx], dtype=np.float32
+                                    ).copy(),
+                                    "created_at": time.perf_counter(),
+                                    "masked": (
+                                        masked_flags[audio_idx]
+                                        if audio_idx < len(masked_flags) else False
+                                    ),
+                                })
+                                staged_audio_seq += 1
+                                audio_published += 1
+
+                        frames_published = 0
                         for sb_start in range(0, n_frames, fm_engine.render_sub_batch):
                             sb_end = min(sb_start + fm_engine.render_sub_batch, n_frames)
                             sub_motion = motion[sb_start:sb_end]
@@ -5047,42 +5142,44 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                                 total_gen_ms=total_gen_ms,
                             )
 
+                            # Frames first, then the audio they cover, so the
+                            # browser always holds the visual reserve for any
+                            # audio that has advanced its playback clock.
                             for pkt in packets:
-                                staged_frames.append(pkt)
+                                _enqueue_frame(pkt)
+                                frames_published += 1
+                            if n_frames > 0:
+                                _publish_audio_through(
+                                    (sb_end * n_audio_steps) // n_frames
+                                )
 
-                        # Atomic publication: do not let speech escape before
-                        # all matching frames are ready. This intentionally adds
-                        # one 2-second generation buffer to preserve A/V sync.
-                        # Frames go first so the browser has the complete visual
-                        # reserve before audio advances its playback clock.
-                        for pkt in staged_frames:
-                            _enqueue_frame(pkt)
-                        # force_idle marks a step whose outgoing audio is the
-                        # thinking sound or the post-injection mask, not the
-                        # assistant's answer. It travels with the packet so the
-                        # sender does not mistake the waiting cue for the
-                        # answer starting to stream (audio_stream_started).
-                        # Indexed defensively: used_audio/used_steps are sliced
-                        # together on every path that sets both, but one branch
-                        # reassigns used_steps alone.
-                        masked_flags = [bool(s.get("force_idle")) for s in used_steps]
-                        for audio_idx, audio_step in enumerate(used_audio):
-                            _enqueue_audio({
-                                "audio_packet_index": staged_audio_seq,
-                                "audio_pcm": np.asarray(audio_step, dtype=np.float32).copy(),
-                                "created_at": time.perf_counter(),
-                                "masked": (
-                                    masked_flags[audio_idx]
-                                    if audio_idx < len(masked_flags) else False
-                                ),
-                            })
-                            staged_audio_seq += 1
+                            if not prebuffer_ready.is_set() and audio_published:
+                                # Anchor the shared media epoch on the FIRST
+                                # sub-batch that carries audio, not on the whole
+                                # chunk. Both senders start from the same epoch
+                                # with matching indices already queued, so this
+                                # moves the entire media timeline earlier
+                                # without skewing audio against video.
+                                prebuffer_ready.set()
+                                print(
+                                    f"[GPU][INTERLEAVED] first release audio={audio_published} "
+                                    f"frames={frames_published}/{n_frames} "
+                                    f"generation={active_generation}",
+                                    flush=True,
+                                )
+
+                        # Safety net: emit anything the integer mapping above
+                        # could not attribute to a rendered frame (n_frames == 0,
+                        # or more audio steps than the frame grid covers). Never
+                        # drop audio -- a missing packet index would shift every
+                        # later packet's schedule and skew A/V permanently.
+                        _publish_audio_through(n_audio_steps)
 
                         if not prebuffer_ready.is_set():
                             prebuffer_ready.set()
                             print(
-                                f"[GPU][ATOMIC-2S] released audio={len(used_audio)} "
-                                f"frames={len(staged_frames)} generation={active_generation}",
+                                f"[GPU][INTERLEAVED] released audio={audio_published} "
+                                f"frames={frames_published} generation={active_generation}",
                                 flush=True,
                             )
 
@@ -5272,7 +5369,16 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                         # would report the waiting cue as the answer starting.
                         # Cheap, non-blocking, never raises.
                         if reply_engine is not None and not packet.get("masked"):
-                            reply_engine.note_audio_streamed(packet_rms)
+                            reply_engine.note_audio_streamed(
+                                packet_rms,
+                                queued_s=(
+                                    send_wall - float(packet["created_at"])
+                                    if packet.get("created_at") is not None else None
+                                ),
+                                audio_q_depth=(
+                                    audio_q.qsize() if audio_q is not None else None
+                                ),
+                            )
 
                     if packets_sent and packets_sent % 50 == 0:
                         print(

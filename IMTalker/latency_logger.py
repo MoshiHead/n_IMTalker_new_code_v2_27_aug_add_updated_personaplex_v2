@@ -97,6 +97,14 @@ HEADLINES: list[tuple[str, str]] = [
     ("question_to_first_audio_s", "question -> first audio GENERATED"),
     ("question_to_audio_out_s", "question -> first audio SENT to browser"),
     ("generated_to_sent_s", "audio generated -> audio sent (pipeline delay)"),
+    # The two halves of that pipeline delay. produce_to_publish_s is the GPU
+    # side (waiting for the rest of the chunk's 12.5Hz steps, then FM +
+    # render/JPEG of the frames the audio is interleaved with);
+    # audio_queue_wait_s is how long the packet then sat in audio_q waiting for
+    # its slot on the shared media clock. Tune the first with chunk/render
+    # cost, the second with --frame_q_backpressure.
+    ("produce_to_publish_s", "   ...of which: model audio -> queued for sending"),
+    ("audio_queue_wait_s", "   ...of which: waiting in the send queue"),
     ("question_to_first_word_s", "question -> FIRST spoken word"),
     ("question_to_answer_complete_s", "question -> answer fully spoken"),
     ("answer_speaking_s", "duration of the spoken answer"),
@@ -374,6 +382,13 @@ class LatencyLogger:
             m["answer_speaking_s"] = round(
                 max(0.0, rec.marks["answer_complete"] - rec.marks["first_word"]), 3
             )
+        # Reported by the websocket audio sender rather than derived from marks
+        # (only it knows when a packet was published vs. when it went out), so
+        # lift them out of the counters to sit under the total they decompose.
+        for field in ("produce_to_publish_s", "audio_queue_wait_s"):
+            value = rec.counters.get(field)
+            if isinstance(value, (int, float)):
+                m[field] = float(value)
         return m
 
     def _render_block(self, rec: TurnLatency, metrics: dict[str, float]) -> str:

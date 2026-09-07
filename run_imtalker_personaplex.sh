@@ -191,16 +191,23 @@ fi
 # Without this cap a RunPod RTX 5090 run measured a rock-steady 9.1-9.6s of standing
 # latency on every turn -- that is the whole difference between ~3-4s and 10-12s
 # answers on questions the model answers from its own knowledge. When the cap is hit
-# the OLDEST audio is dropped and loudly logged. Lower it (e.g. 1.0) to trade a
-# little completeness for less latency; set 0 only to reproduce the old unbounded
-# behaviour.
+# the OLDEST audio is dropped and loudly logged.
+#
+# 1.2s, not 2.0s: 2.0s is exactly one avatar chunk, i.e. just enough buffered
+# audio for the PersonaPlex worker to get a WHOLE CHUNK ahead of the render
+# thread during the session-start burst -- and that lead never drains, because
+# from then on both run at exactly real time. Simulated against the render cost
+# measured in conversation_1.log, every value from 0.4s to 1.5s delivers the
+# same latency and 2.0s costs ~0.5s more. 1.2s keeps margin for bursty Opus
+# arrival over the RunPod proxy while staying below that cliff. Set 0 only to
+# reproduce the old unbounded behaviour.
 #
 # MAX_EVENT_BACKLOG_SEC bounds persona_event_q the same way. It must stay ABOVE the
 # pipeline's designed sawtooth -- the consumer swallows a whole --audio_chunk_sec
 # chunk at once, so that queue normally oscillates 0 -> ~2.0s -- and the previous
 # 0.6s default sat below that floor, throttling the model continuously (logs_7).
 declare -A hashes=(
- ["$IM/imtalker_personaplex_try_vad2_8998.py"]="f09c826cec5ee472c7211c0ae01a8d1da5005a4036c4ccabd590dd8be711ffb4"
+ ["$IM/imtalker_personaplex_try_vad2_8998.py"]="ce50a8bb6eb810fc7a62342e1fd2b518ea3a28de4c43c801085ac70eefc78197"
  ["$IM/static/index_v3_binary_fullscreen_robot_try_vad2.html"]="5cf3981351668e0366b7b4adf2f36c7e43f5ab0c672f6616a343a72817582fa6"
  ["$IM/static/assets/robert_idle_10s.mp4"]="6bdfb847fb3dd2a76d42278a138e26e2729bf5ed938f6733a3b428768a9e7916"
  ["$IM/experiments/original_pod_8998/FM.py"]="8620d6cad2b945276a792a1d63159369654cbb83f9114ab5788f93a3d8daf5d9"
@@ -260,5 +267,5 @@ exec python -u "$IM/imtalker_personaplex_try_vad2_8998.py" \
  --blink_motion_path "$ROOT/checkpoints/lora/3robert_audio3_ditto_static_motion.pt" --enable_eye_blink_composite \
  --suppress_media_watchdog_sec "${SUPPRESS_MEDIA_WATCHDOG_SEC:-3.0}" \
  --max_event_backlog_sec "${MAX_EVENT_BACKLOG_SEC:-3.0}" \
- --max_input_buffer_sec "${MAX_INPUT_BUFFER_SEC:-2.0}" \
+ --max_input_buffer_sec "${MAX_INPUT_BUFFER_SEC:-1.2}" \
  "${SEARCH_ARGS[@]}"
